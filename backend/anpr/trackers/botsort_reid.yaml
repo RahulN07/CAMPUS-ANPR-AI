@@ -1,0 +1,19 @@
+# Campus ANPR BoT-SORT configuration with appearance ReID.
+# Compatible with the Ultralytics 8.4.100 tracker schema.
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.80
+fuse_score: True
+
+# Campus gate cameras are fixed, so camera-motion compensation is unnecessary.
+gmc_method: none
+
+# Re-identification reconnects a temporarily lost vehicle using appearance.
+proximity_thresh: 0.50
+appearance_thresh: 0.80
+with_reid: True
+model: auto

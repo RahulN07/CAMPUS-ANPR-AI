@@ -104,6 +104,22 @@ from anpr.vehicle_processor import (
 )
 from records.models import EntryExitRecord
 
+from anpr.tracking_pipeline import (
+    CameraTrackingPipeline,
+    TrackingPipelineConfig,
+)
+from anpr.vehicle_tracker import (
+    VehicleDetection,
+    VehicleTrackingResult,
+)
+from anpr.vehicle_processor import (
+    VehicleProcessingResult,
+)
+from anpr.vehicle_worker_pool import (
+    WorkerPoolState,
+    WorkerPoolStats,
+)
+
 class FakeBox:
     def __init__(
         self,
@@ -4955,4 +4971,869 @@ class VehicleProcessorRecordSaveTests(TestCase):
         self.assertEqual(
             record.detected_vehicle_model,
             "Nexon",
+        )
+
+class FakePipelineCacheService:
+    def __init__(
+        self,
+        events=None,
+        start_error=None,
+    ):
+        self.events = (
+            events if events is not None else []
+        )
+        self.start_error = start_error
+        self.running = False
+        self.stop_calls = []
+
+    def start(self, *, warm=True):
+        self.events.append(
+            ("cache-start", warm)
+        )
+
+        if self.start_error:
+            raise self.start_error
+
+        self.running = True
+        return True
+
+    def stop(self, timeout=5.0):
+        self.events.append(
+            ("cache-stop", timeout)
+        )
+        self.stop_calls.append(timeout)
+        self.running = False
+        return True
+
+
+class FakePipelineWorkerPool:
+    def __init__(
+        self,
+        *,
+        events=None,
+        accepts=True,
+        start_error=None,
+    ):
+        self.events = (
+            events if events is not None else []
+        )
+        self.accepts = accepts
+        self.start_error = start_error
+        self.running = False
+        self.submitted = []
+        self.stop_calls = []
+
+    def start(self):
+        self.events.append("worker-start")
+
+        if self.start_error:
+            raise self.start_error
+
+        self.running = True
+        return True
+
+    def submit(self, task):
+        self.submitted.append(task)
+        return self.accepts
+
+    def stop(
+        self,
+        *,
+        drain=True,
+        timeout=None,
+    ):
+        self.events.append(
+            ("worker-stop", drain, timeout)
+        )
+        self.stop_calls.append(
+            (drain, timeout)
+        )
+        self.running = False
+        return True
+
+    def stats(self):
+        return WorkerPoolStats(
+            state=(
+                WorkerPoolState.RUNNING
+                if self.running
+                else WorkerPoolState.STOPPED
+            ),
+            submitted=len(self.submitted),
+            completed=0,
+            failed=0,
+            rejected_full=(
+                0 if self.accepts else 1
+            ),
+            rejected_not_running=0,
+            discarded_on_stop=0,
+            queue_size=0,
+            queue_capacity=100,
+            in_flight=0,
+            live_workers=(
+                1 if self.running else 0
+            ),
+            last_error="",
+        )
+
+
+class FakePipelineTracker:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def track(self, frame):
+        self.calls.append(frame)
+
+        if len(self.results) > 1:
+            return self.results.pop(0)
+
+        return self.results[0]
+
+
+class FakePipelineLineDetector:
+    def __init__(self, events=None):
+        self.events = events or {}
+        self.calls = []
+
+    def update(
+        self,
+        *,
+        track_id,
+        center,
+        frame_width,
+        frame_height,
+        frame_index,
+    ):
+        self.calls.append(
+            (
+                track_id,
+                center,
+                frame_index,
+            )
+        )
+        return self.events.get(
+            (track_id, frame_index)
+        )
+
+
+class FakePipelineCandidateBuffer:
+    def __init__(self, tasks=None):
+        self.tasks = tasks or {}
+        self.observations = []
+        self.finalize_calls = []
+
+    def observe(
+        self,
+        *,
+        frame,
+        detection,
+        frame_index,
+        captured_at,
+    ):
+        self.observations.append(
+            (
+                detection.track_id,
+                frame_index,
+            )
+        )
+        return True
+
+    def finalize(self, crossing):
+        self.finalize_calls.append(
+            crossing.track_id
+        )
+        return self.tasks.get(
+            crossing.track_id
+        )
+
+
+class CameraTrackingPipelineTests(SimpleTestCase):
+    def make_gate(self, **overrides):
+        values = {
+            "pk": 1,
+            "gate_type": "ENTRY",
+            "line_start_x": 0.1,
+            "line_start_y": 0.5,
+            "line_end_x": 0.9,
+            "line_end_y": 0.5,
+            "crossing_direction": "ANY",
+            "line_crossing_enabled": True,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def make_detection(
+        self,
+        *,
+        track_id=12,
+        vehicle_type="car",
+        bbox=(30, 120, 130, 180),
+    ):
+        return VehicleDetection(
+            track_id=track_id,
+            class_id=2,
+            vehicle_type=vehicle_type,
+            confidence=0.9,
+            bbox=bbox,
+        )
+
+    def make_tracking_result(
+        self,
+        detections,
+        *,
+        inference_ms=5.0,
+    ):
+        return VehicleTrackingResult(
+            detections=tuple(detections),
+            frame_width=300,
+            frame_height=200,
+            inference_ms=inference_ms,
+        )
+
+    def make_crossing(
+        self,
+        track_id=12,
+        frame_index=1,
+    ):
+        return LineCrossingEvent(
+            track_id=track_id,
+            physical_direction="A_TO_B",
+            previous_point=NormalizedPoint(
+                0.4,
+                0.7,
+            ),
+            current_point=NormalizedPoint(
+                0.4,
+                0.3,
+            ),
+            intersection_point=NormalizedPoint(
+                0.4,
+                0.5,
+            ),
+            frame_index=frame_index,
+        )
+
+    def make_task(
+        self,
+        track_id=12,
+    ):
+        candidate = VehicleFrameCandidate(
+            track_id=track_id,
+            frame_index=0,
+            captured_at=0.0,
+            vehicle_type="car",
+            vehicle_confidence=0.9,
+            source_bbox=(30, 120, 130, 180),
+            sharpness=10.0,
+            quality_score=10.0,
+            crop=np.zeros(
+                (60, 100, 3),
+                dtype=np.uint8,
+            ),
+        )
+
+        return FinalizedVehicleTrack(
+            track_id=track_id,
+            vehicle_type="car",
+            physical_direction="A_TO_B",
+            crossing_frame_index=1,
+            created_at=time.monotonic(),
+            candidates=(candidate,),
+        )
+
+    def make_pipeline(
+        self,
+        *,
+        tracker=None,
+        line_detector=None,
+        candidate_buffer=None,
+        cache_service=None,
+        worker_pool=None,
+        gate=None,
+        on_activity=None,
+        on_error=None,
+    ):
+        tracker = tracker or FakePipelineTracker(
+            [
+                self.make_tracking_result(
+                    []
+                )
+            ]
+        )
+        line_detector = (
+            line_detector
+            or FakePipelineLineDetector()
+        )
+        candidate_buffer = (
+            candidate_buffer
+            or FakePipelineCandidateBuffer()
+        )
+        cache_service = (
+            cache_service
+            or FakePipelineCacheService()
+        )
+        worker_pool = (
+            worker_pool
+            or FakePipelineWorkerPool()
+        )
+
+        return CameraTrackingPipeline(
+            gate=gate or self.make_gate(),
+            recorded_by_id=1,
+            cache=VehicleCache(),
+            tracker=tracker,
+            line_detector=line_detector,
+            candidate_buffer=candidate_buffer,
+            cache_service=cache_service,
+            worker_pool=worker_pool,
+            on_activity=on_activity,
+            on_error=on_error,
+        )
+
+    def test_configuration_is_validated(self):
+        with self.assertRaises(ValueError):
+            TrackingPipelineConfig(
+                worker_count=0,
+            )
+
+        with self.assertRaises(ValueError):
+            TrackingPipelineConfig(
+                vehicle_queue_size=0,
+            )
+
+        with self.assertRaises(ValueError):
+            TrackingPipelineConfig(
+                candidates_per_track=2,
+                required_unknown_votes=3,
+            )
+
+        with self.assertRaises(ValueError):
+            TrackingPipelineConfig(
+                cache_refresh_seconds=0,
+            )
+
+    def test_gate_and_user_are_validated(self):
+        with self.assertRaises(ValueError):
+            CameraTrackingPipeline(
+                gate=self.make_gate(pk=None),
+                recorded_by_id=1,
+            )
+
+        with self.assertRaises(ValueError):
+            CameraTrackingPipeline(
+                gate=self.make_gate(),
+                recorded_by_id=0,
+            )
+
+    def test_start_order_and_duplicate_start(self):
+        events = []
+        cache_service = (
+            FakePipelineCacheService(
+                events=events
+            )
+        )
+        worker_pool = FakePipelineWorkerPool(
+            events=events
+        )
+        pipeline = self.make_pipeline(
+            cache_service=cache_service,
+            worker_pool=worker_pool,
+        )
+
+        try:
+            self.assertTrue(pipeline.start())
+            self.assertFalse(pipeline.start())
+            self.assertEqual(
+                events[:2],
+                [
+                    ("cache-start", True),
+                    "worker-start",
+                ],
+            )
+            self.assertTrue(
+                pipeline.stats().running
+            )
+        finally:
+            pipeline.stop()
+
+    def test_worker_start_failure_stops_cache_service(self):
+        events = []
+        cache_service = (
+            FakePipelineCacheService(
+                events=events
+            )
+        )
+        worker_pool = FakePipelineWorkerPool(
+            events=events,
+            start_error=RuntimeError(
+                "workers unavailable"
+            ),
+        )
+        pipeline = self.make_pipeline(
+            cache_service=cache_service,
+            worker_pool=worker_pool,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "workers unavailable",
+        ):
+            pipeline.start()
+
+        self.assertIn(
+            ("cache-stop", 5.0),
+            events,
+        )
+        self.assertFalse(
+            pipeline.stats().running
+        )
+
+    def test_frame_before_start_is_rejected(self):
+        pipeline = self.make_pipeline()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "not running",
+        ):
+            pipeline.process_frame(
+                frame=np.zeros(
+                    (200, 300, 3),
+                    dtype=np.uint8,
+                ),
+                frame_index=0,
+            )
+
+    def test_frame_index_must_increase(self):
+        pipeline = self.make_pipeline()
+        frame = np.zeros(
+            (200, 300, 3),
+            dtype=np.uint8,
+        )
+        pipeline.start()
+
+        try:
+            pipeline.process_frame(
+                frame=frame,
+                frame_index=1,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "monotonically",
+            ):
+                pipeline.process_frame(
+                    frame=frame,
+                    frame_index=1,
+                )
+        finally:
+            pipeline.stop()
+
+    def test_untracked_vehicle_is_visible_but_not_buffered(self):
+        detection = self.make_detection(
+            track_id=None,
+        )
+        tracker = FakePipelineTracker(
+            [
+                self.make_tracking_result(
+                    [detection]
+                )
+            ]
+        )
+        line_detector = (
+            FakePipelineLineDetector()
+        )
+        candidate_buffer = (
+            FakePipelineCandidateBuffer()
+        )
+        pipeline = self.make_pipeline(
+            tracker=tracker,
+            line_detector=line_detector,
+            candidate_buffer=candidate_buffer,
+        )
+        pipeline.start()
+
+        try:
+            result = pipeline.process_frame(
+                frame=np.zeros(
+                    (200, 300, 3),
+                    dtype=np.uint8,
+                ),
+                frame_index=0,
+            )
+
+            self.assertEqual(
+                result.vehicle_count,
+                1,
+            )
+            self.assertEqual(
+                result.tracked_count,
+                0,
+            )
+            self.assertEqual(
+                candidate_buffer.observations,
+                [],
+            )
+            self.assertEqual(
+                line_detector.calls,
+                [],
+            )
+        finally:
+            pipeline.stop()
+
+    def test_crossing_without_candidate_is_reported_rejected(self):
+        detection = self.make_detection()
+        crossing = self.make_crossing()
+        tracker = FakePipelineTracker(
+            [
+                self.make_tracking_result(
+                    [detection]
+                )
+            ]
+        )
+        line_detector = (
+            FakePipelineLineDetector(
+                events={
+                    (12, 1): crossing,
+                }
+            )
+        )
+        candidate_buffer = (
+            FakePipelineCandidateBuffer()
+        )
+        worker_pool = FakePipelineWorkerPool()
+        pipeline = self.make_pipeline(
+            tracker=tracker,
+            line_detector=line_detector,
+            candidate_buffer=candidate_buffer,
+            worker_pool=worker_pool,
+        )
+        pipeline.start()
+
+        try:
+            result = pipeline.process_frame(
+                frame=np.zeros(
+                    (200, 300, 3),
+                    dtype=np.uint8,
+                ),
+                frame_index=1,
+            )
+
+            self.assertEqual(
+                result.rejected_track_ids,
+                (12,),
+            )
+            self.assertEqual(
+                worker_pool.submitted,
+                [],
+            )
+            self.assertEqual(
+                pipeline.stats().tasks_rejected,
+                1,
+            )
+        finally:
+            pipeline.stop()
+
+    def test_full_vehicle_queue_is_nonblocking_and_counted(self):
+        detection = self.make_detection()
+        crossing = self.make_crossing()
+        task = self.make_task()
+        tracker = FakePipelineTracker(
+            [
+                self.make_tracking_result(
+                    [detection]
+                )
+            ]
+        )
+        line_detector = (
+            FakePipelineLineDetector(
+                events={
+                    (12, 1): crossing,
+                }
+            )
+        )
+        candidate_buffer = (
+            FakePipelineCandidateBuffer(
+                tasks={
+                    12: task,
+                }
+            )
+        )
+        worker_pool = FakePipelineWorkerPool(
+            accepts=False
+        )
+        pipeline = self.make_pipeline(
+            tracker=tracker,
+            line_detector=line_detector,
+            candidate_buffer=candidate_buffer,
+            worker_pool=worker_pool,
+        )
+        pipeline.start()
+
+        try:
+            started = time.perf_counter()
+            result = pipeline.process_frame(
+                frame=np.zeros(
+                    (200, 300, 3),
+                    dtype=np.uint8,
+                ),
+                frame_index=1,
+            )
+            elapsed = (
+                time.perf_counter() - started
+            )
+
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(
+                result.rejected_track_ids,
+                (12,),
+            )
+            self.assertEqual(
+                pipeline.stats().tasks_rejected,
+                1,
+            )
+        finally:
+            pipeline.stop()
+
+    def test_real_flow_tracks_all_vehicles_and_submits_crossings(self):
+        first_detections = [
+            self.make_detection(
+                track_id=12,
+                bbox=(30, 120, 130, 180),
+            ),
+            self.make_detection(
+                track_id=13,
+                vehicle_type="motorcycle",
+                bbox=(170, 120, 250, 180),
+            ),
+        ]
+        second_detections = [
+            self.make_detection(
+                track_id=12,
+                bbox=(30, 20, 130, 80),
+            ),
+            self.make_detection(
+                track_id=13,
+                vehicle_type="motorcycle",
+                bbox=(170, 20, 250, 80),
+            ),
+        ]
+        tracker = FakePipelineTracker(
+            [
+                self.make_tracking_result(
+                    first_detections
+                ),
+                self.make_tracking_result(
+                    second_detections
+                ),
+            ]
+        )
+        cache = VehicleCache()
+        cache.refresh([])
+        cache_service = (
+            FakePipelineCacheService()
+        )
+        activities = []
+
+        def processor_factory():
+            def process(task):
+                return VehicleProcessingResult(
+                    track_id=task.track_id,
+                    saved=True,
+                    reason="SAVED",
+                    plate_text="KA25AB1234",
+                    record_id=(
+                        1000 + task.track_id
+                    ),
+                )
+
+            return process
+
+        pipeline = CameraTrackingPipeline(
+            gate=self.make_gate(),
+            recorded_by_id=1,
+            config=TrackingPipelineConfig(
+                worker_count=2,
+                vehicle_queue_size=10,
+            ),
+            cache=cache,
+            tracker=tracker,
+            cache_service=cache_service,
+            processor_factory=(
+                processor_factory
+            ),
+            on_activity=lambda track, result: (
+                activities.append(
+                    (track.track_id, result.record_id)
+                )
+            ),
+        )
+        frame = np.zeros(
+            (200, 300, 3),
+            dtype=np.uint8,
+        )
+        pipeline.start()
+
+        try:
+            first = pipeline.process_frame(
+                frame=frame,
+                frame_index=0,
+            )
+            second = pipeline.process_frame(
+                frame=frame,
+                frame_index=1,
+            )
+
+            self.assertEqual(
+                first.submitted_track_ids,
+                (),
+            )
+            self.assertCountEqual(
+                second.submitted_track_ids,
+                [12, 13],
+            )
+            self.assertTrue(
+                pipeline.worker_pool.wait_until_idle(
+                    2
+                )
+            )
+
+            stats = pipeline.stats()
+
+            self.assertEqual(
+                stats.frames_processed,
+                2,
+            )
+            self.assertEqual(
+                stats.vehicles_observed,
+                4,
+            )
+            self.assertEqual(
+                stats.tracked_vehicles_observed,
+                4,
+            )
+            self.assertEqual(
+                stats.line_crossings,
+                2,
+            )
+            self.assertEqual(
+                stats.tasks_submitted,
+                2,
+            )
+            self.assertEqual(
+                stats.processing_results,
+                2,
+            )
+            self.assertEqual(
+                stats.records_saved,
+                2,
+            )
+            self.assertCountEqual(
+                activities,
+                [
+                    (12, 1012),
+                    (13, 1013),
+                ],
+            )
+        finally:
+            pipeline.stop()
+
+    def test_worker_callbacks_update_activity_statistics(self):
+        activities = []
+        errors = []
+        pipeline = self.make_pipeline(
+            on_activity=lambda track, result: (
+                activities.append(result.reason)
+            ),
+            on_error=lambda track, error: (
+                errors.append(str(error))
+            ),
+        )
+        task = self.make_task()
+
+        pipeline._handle_worker_success(
+            task,
+            VehicleProcessingResult(
+                track_id=12,
+                saved=True,
+                reason="SAVED",
+                record_id=1,
+            ),
+        )
+        pipeline._handle_worker_success(
+            task,
+            VehicleProcessingResult(
+                track_id=12,
+                saved=False,
+                reason="DUPLICATE_IGNORED",
+                record_id=1,
+            ),
+        )
+        pipeline._handle_worker_error(
+            task,
+            RuntimeError("OCR failed"),
+        )
+
+        stats = pipeline.stats()
+
+        self.assertEqual(
+            stats.processing_results,
+            2,
+        )
+        self.assertEqual(
+            stats.records_saved,
+            1,
+        )
+        self.assertEqual(
+            stats.duplicate_results,
+            1,
+        )
+        self.assertEqual(
+            stats.processing_failures,
+            1,
+        )
+        self.assertEqual(
+            activities,
+            [
+                "SAVED",
+                "DUPLICATE_IGNORED",
+            ],
+        )
+        self.assertEqual(
+            errors,
+            ["OCR failed"],
+        )
+        self.assertIn(
+            "OCR failed",
+            stats.last_error,
+        )
+
+    def test_stop_passes_drain_and_timeout_to_workers(self):
+        cache_service = (
+            FakePipelineCacheService()
+        )
+        worker_pool = FakePipelineWorkerPool()
+        pipeline = self.make_pipeline(
+            cache_service=cache_service,
+            worker_pool=worker_pool,
+        )
+        pipeline.start()
+
+        stopped = pipeline.stop(
+            drain=False,
+            timeout=1.5,
+        )
+
+        self.assertTrue(stopped)
+        self.assertEqual(
+            worker_pool.stop_calls,
+            [
+                (False, 1.5),
+            ],
+        )
+        self.assertEqual(
+            cache_service.stop_calls,
+            [5.0],
+        )
+        self.assertFalse(
+            pipeline.stats().running
         )

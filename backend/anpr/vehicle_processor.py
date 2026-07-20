@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import cv2
@@ -19,6 +19,7 @@ from anpr.detector import (
     clamp_bounding_box,
     detect_plate_bboxes,
     preprocess_plate_crop,
+    run_conflict_ocr,
     run_ocr,
 )
 from anpr.plate_validation import validate_and_normalize_plate
@@ -52,6 +53,10 @@ class VehicleProcessorConfig:
     registered_fast_path_confidence: float = 0.55
     single_unknown_confidence: float = 0.95
     duplicate_seconds: float = 5.0
+    evaluate_all_unknown_candidates: bool = False
+    conflict_ocr_min_confidence: float = 0.85
+    conflict_ocr_override_min_confidence: float = 0.90
+    conflict_track_votes: int = 2
 
     def __post_init__(self) -> None:
         if self.gate_id < 1:
@@ -69,6 +74,14 @@ class VehicleProcessorConfig:
                 self.registered_fast_path_confidence,
             ),
             ("single_unknown_confidence", self.single_unknown_confidence),
+            (
+                "conflict_ocr_min_confidence",
+                self.conflict_ocr_min_confidence,
+            ),
+            (
+                "conflict_ocr_override_min_confidence",
+                self.conflict_ocr_override_min_confidence,
+            ),
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1")
@@ -79,6 +92,11 @@ class VehicleProcessorConfig:
         if self.required_unknown_votes > self.maximum_candidates:
             raise ValueError(
                 "required_unknown_votes cannot exceed maximum_candidates"
+            )
+        if not 1 <= self.conflict_track_votes <= self.maximum_candidates:
+            raise ValueError(
+                "conflict_track_votes must be between 1 and "
+                "maximum_candidates"
             )
         if self.duplicate_seconds <= 0:
             raise ValueError("duplicate_seconds must be greater than 0")
@@ -151,6 +169,29 @@ PlateRecognizer = Callable[[VehicleFrameCandidate], PlateObservation | None]
 ColorDetector = Callable[[np.ndarray], tuple[str, float]]
 MakeModelDetector = Callable[[np.ndarray], dict]
 RecordSaver = Callable[[VehicleRecordPayload], int]
+ConflictRecognizer = Callable[[np.ndarray], tuple[str, float]]
+
+
+def _is_single_edit_apart(first: str, second: str) -> bool:
+    """Return whether two non-identical plate strings differ by one edit."""
+
+    if first == second or abs(len(first) - len(second)) > 1:
+        return False
+    if len(first) == len(second):
+        return sum(
+            left != right
+            for left, right in zip(first, second)
+        ) == 1
+
+    shorter, longer = (
+        (first, second)
+        if len(first) < len(second)
+        else (second, first)
+    )
+    return any(
+        longer[:index] + longer[index + 1 :] == shorter
+        for index in range(len(longer))
+    )
 
 
 class RecentPlateGuard:
@@ -259,6 +300,7 @@ class VehicleProcessor:
         color_detector: ColorDetector | None = None,
         make_model_detector: MakeModelDetector | None = None,
         record_saver: RecordSaver | None = None,
+        conflict_recognizer: ConflictRecognizer | None = None,
     ) -> None:
         self.config = config
         self.cache = cache or get_vehicle_cache()
@@ -271,6 +313,9 @@ class VehicleProcessor:
             make_model_detector or predict_vehicle_make_model
         )
         self._record_saver = record_saver or self._save_record
+        self._conflict_recognizer = (
+            conflict_recognizer or run_conflict_ocr
+        )
 
     def process(self, track: FinalizedVehicleTrack) -> VehicleProcessingResult:
         started = time.perf_counter()
@@ -310,6 +355,33 @@ class VehicleProcessor:
                 >= self.config.registered_fast_path_confidence
             ):
                 chosen = observation
+                chosen_lookup = lookup
+                break
+
+            # Unknown vehicles require repeated agreement, but there is no
+            # benefit in running OCR on another crop after the configured
+            # number of exact votes has already been collected. Select the
+            # strongest observation from the agreeing group and finish this
+            # track immediately. This keeps the same consensus rule while
+            # removing one expensive PaddleOCR call in the normal 2-of-3
+            # configuration.
+            agreeing = [
+                item
+                for item in observations
+                if item.plate_text == observation.plate_text
+            ]
+            if (
+                not self.config.evaluate_all_unknown_candidates
+                and len(agreeing) >= self.config.required_unknown_votes
+            ):
+                chosen = max(
+                    agreeing,
+                    key=lambda item: (
+                        item.confidence,
+                        item.candidate.quality_score,
+                        item.candidate.frame_index,
+                    ),
+                )
                 chosen_lookup = lookup
                 break
 
@@ -462,21 +534,83 @@ class VehicleProcessor:
             confidence_threshold=self.config.plate_confidence,
         )
         if not candidates:
+            logger.warning(
+                "Track %s frame %s: PLATE_NOT_DETECTED "
+                "(vehicle crop %sx%s, threshold %.2f)",
+                candidate.track_id,
+                candidate.frame_index,
+                image.shape[1],
+                image.shape[0],
+                self.config.plate_confidence,
+            )
             return None
 
         best = candidates[0]
         bbox_list = clamp_bounding_box(best["bounding_box"], image)
         if bbox_list is None:
+            logger.warning(
+                "Track %s frame %s: INVALID_PLATE_BOX "
+                "(raw box %r, vehicle crop %sx%s)",
+                candidate.track_id,
+                candidate.frame_index,
+                best.get("bounding_box"),
+                image.shape[1],
+                image.shape[0],
+            )
             return None
+
+        # Plate detectors commonly fit the visible plate border very tightly.
+        # At CCTV resolution that can place the first or last character on the
+        # crop boundary, causing recognition to drop it. Add proportional,
+        # bounded context before OCR while keeping the crop inside the vehicle.
+        detected_x1, detected_y1, detected_x2, detected_y2 = bbox_list
+        detected_width = detected_x2 - detected_x1
+        detected_height = detected_y2 - detected_y1
+        horizontal_padding = max(
+            2,
+            int(round(detected_width * 0.12)),
+        )
+        vertical_padding = max(
+            2,
+            int(round(detected_height * 0.18)),
+        )
+        padded_bbox = clamp_bounding_box(
+            [
+                detected_x1 - horizontal_padding,
+                detected_y1 - vertical_padding,
+                detected_x2 + horizontal_padding,
+                detected_y2 + vertical_padding,
+            ],
+            image,
+        )
+        if padded_bbox is not None:
+            bbox_list = padded_bbox
+
         x1, y1, x2, y2 = bbox_list
         plate_crop = image[y1:y2, x1:x2]
         if plate_crop.size == 0:
+            logger.warning(
+                "Track %s frame %s: EMPTY_PLATE_CROP "
+                "(box %s)",
+                candidate.track_id,
+                candidate.frame_index,
+                (x1, y1, x2, y2),
+            )
             return None
 
         raw_text, ocr_confidence = run_ocr(
             preprocess_plate_crop(plate_crop)
         )
         if not raw_text:
+            logger.warning(
+                "Track %s frame %s: OCR_EMPTY "
+                "(plate crop %sx%s, YOLO %.3f)",
+                candidate.track_id,
+                candidate.frame_index,
+                plate_crop.shape[1],
+                plate_crop.shape[0],
+                float(best["confidence"]),
+            )
             return None
 
         validation = validate_and_normalize_plate(
@@ -485,6 +619,17 @@ class VehicleProcessor:
             allow_edge_noise=False,
         )
         if not validation.is_valid:
+            logger.warning(
+                "Track %s frame %s: PLATE_FORMAT_REJECTED "
+                "(raw=%r, OCR %.3f, YOLO %.3f, crop %sx%s)",
+                candidate.track_id,
+                candidate.frame_index,
+                raw_text,
+                float(ocr_confidence),
+                float(best["confidence"]),
+                plate_crop.shape[1],
+                plate_crop.shape[0],
+            )
             return None
 
         yolo_confidence = float(best["confidence"])
@@ -493,6 +638,21 @@ class VehicleProcessor:
             float(ocr_confidence) - validation.corrections * 0.05,
         )
         overall = round((yolo_confidence + adjusted_ocr) / 2.0, 3)
+        logger.warning(
+            "Track %s frame %s: PLATE_VALIDATED "
+            "(plate=%s, raw=%r, overall %.3f, OCR %.3f, "
+            "YOLO %.3f, corrections=%s, crop %sx%s)",
+            candidate.track_id,
+            candidate.frame_index,
+            validation.normalized_text,
+            raw_text,
+            overall,
+            float(ocr_confidence),
+            yolo_confidence,
+            validation.corrections,
+            plate_crop.shape[1],
+            plate_crop.shape[0],
+        )
         return PlateObservation(
             plate_text=validation.normalized_text,
             raw_text=raw_text,
@@ -525,7 +685,37 @@ class VehicleProcessor:
                 item[0],
             ),
         )
-        del winner_plate
+        logger.warning(
+            "Unknown-plate consensus groups: %s; winner=%s",
+            {
+                plate: [
+                    {
+                        "frame": value.candidate.frame_index,
+                        "confidence": value.confidence,
+                        "ocr": round(value.ocr_confidence, 3),
+                        "yolo": round(value.plate_yolo_confidence, 3),
+                    }
+                    for value in values
+                ]
+                for plate, values in sorted(groups.items())
+            },
+            winner_plate,
+        )
+
+        if (
+            self.config.evaluate_all_unknown_candidates
+            and groups
+        ):
+            resolved = self._resolve_unknown_identity_conflict(groups)
+            if resolved is not None:
+                return resolved, max(
+                    1,
+                    len(groups.get(resolved.plate_text, ())),
+                )
+            # Full-evaluation mode is fail closed. Mobile OCR must not save a
+            # plate after the independent arbitration stage was inconclusive.
+            return None, len(winner_group)
+
         votes = len(winner_group)
         best = max(
             winner_group,
@@ -540,6 +730,193 @@ class VehicleProcessor:
         if best.confidence >= self.config.single_unknown_confidence:
             return best, votes
         return None, votes
+
+    def _resolve_unknown_identity_conflict(
+        self,
+        groups: dict[str, list[PlateObservation]],
+    ) -> PlateObservation | None:
+        """Require stable V6 consensus across multiple retained frames."""
+
+        observations = [
+            observation
+            for values in groups.values()
+            for observation in values
+            if observation.plate_image_bytes
+        ]
+        if not observations:
+            return None
+
+        def resolution_rank(
+            observation: PlateObservation,
+        ) -> tuple[int, int, float, float]:
+            x1, y1, x2, y2 = observation.bounding_box
+            width = max(0, x2 - x1)
+            height = max(0, y2 - y1)
+            return (
+                height,
+                width * height,
+                observation.ocr_confidence,
+                observation.confidence,
+            )
+
+        ranked_observations = sorted(
+            observations,
+            key=resolution_rank,
+            reverse=True,
+        )
+        mobile_identities = set(groups)
+        conflict_groups: dict[
+            str,
+            list[tuple[PlateObservation, str, float, object]],
+        ] = {}
+
+        for observation in ranked_observations:
+            assert observation.plate_image_bytes is not None
+            encoded = np.frombuffer(
+                observation.plate_image_bytes,
+                dtype=np.uint8,
+            )
+            plate_crop = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if plate_crop is None or plate_crop.size == 0:
+                continue
+
+            try:
+                raw_text, confidence = self._conflict_recognizer(plate_crop)
+            except Exception:
+                logger.exception(
+                    "Track %s frame %s: conflict OCR failed",
+                    observation.candidate.track_id,
+                    observation.candidate.frame_index,
+                )
+                continue
+
+            validation = validate_and_normalize_plate(
+                raw_text,
+                max_corrections=1,
+                allow_edge_noise=False,
+            )
+            normalized = validation.normalized_text
+            if (
+                not validation.is_valid
+                or float(confidence)
+                < self.config.conflict_ocr_min_confidence
+            ):
+                continue
+
+            same_mobile_identity = normalized in mobile_identities
+            one_edit_override = (
+                any(
+                    _is_single_edit_apart(normalized, mobile_identity)
+                    for mobile_identity in mobile_identities
+                )
+                and float(confidence)
+                >= self.config.conflict_ocr_override_min_confidence
+            )
+            if not (same_mobile_identity or one_edit_override):
+                logger.warning(
+                    "Track %s frame %s: conflict identity %s is not a "
+                    "safe one-edit match for mobile identities %s",
+                    observation.candidate.track_id,
+                    observation.candidate.frame_index,
+                    normalized,
+                    sorted(mobile_identities),
+                )
+                continue
+
+            identity_votes = conflict_groups.setdefault(normalized, [])
+            identity_votes.append(
+                (observation, raw_text, float(confidence), validation)
+            )
+            if len(identity_votes) >= self.config.conflict_track_votes:
+                logger.warning(
+                    "Track %s: V6 cross-frame requirement reached for %s "
+                    "after frame %s",
+                    observation.candidate.track_id,
+                    normalized,
+                    observation.candidate.frame_index,
+                )
+                break
+
+        if not conflict_groups:
+            logger.warning(
+                "Track %s: no stable V6 frame observations",
+                ranked_observations[0].candidate.track_id,
+            )
+            return None
+
+        normalized, winning_group = max(
+            conflict_groups.items(),
+            key=lambda item: (
+                len(item[1]),
+                sum(value[2] for value in item[1]),
+                max(value[2] for value in item[1]),
+            ),
+        )
+        if len(winning_group) < self.config.conflict_track_votes:
+            logger.warning(
+                "Track %s: V6 cross-frame consensus not reached: %s",
+                ranked_observations[0].candidate.track_id,
+                {
+                    plate: [
+                        {
+                            "frame": value[0].candidate.frame_index,
+                            "confidence": round(value[2], 3),
+                        }
+                        for value in values
+                    ]
+                    for plate, values in sorted(conflict_groups.items())
+                },
+            )
+            return None
+
+        source_observation, raw_text, confidence, validation = max(
+            winning_group,
+            key=lambda value: (
+                value[2],
+                resolution_rank(value[0]),
+            ),
+        )
+        if normalized in groups:
+            chosen = max(
+                groups[normalized],
+                key=lambda observation: (
+                    resolution_rank(observation),
+                    observation.candidate.quality_score,
+                    observation.candidate.frame_index,
+                ),
+            )
+        else:
+            corrected_confidence = round(
+                (
+                    source_observation.plate_yolo_confidence
+                    + confidence
+                )
+                / 2.0,
+                3,
+            )
+            chosen = replace(
+                source_observation,
+                plate_text=normalized,
+                raw_text=raw_text,
+                confidence=corrected_confidence,
+                ocr_confidence=confidence,
+                corrections=validation.corrections,
+            )
+            logger.warning(
+                "Track %s: V6 cross-frame consensus overrode mobile "
+                "identity to %s",
+                source_observation.candidate.track_id,
+                normalized,
+            )
+
+        logger.warning(
+            "Track %s: V6 cross-frame consensus resolved %s "
+            "with %s frame votes",
+            source_observation.candidate.track_id,
+            normalized,
+            len(winning_group),
+        )
+        return chosen
 
     def _save_record(self, payload: VehicleRecordPayload) -> int:
         unique = (

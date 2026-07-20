@@ -295,19 +295,46 @@ class TrackCandidateBuffer:
         state: _BufferedTrack,
         candidate: VehicleFrameCandidate,
     ) -> bool:
+        """Retain two recent views and quality-ranked historical fallbacks.
+
+        OCR consensus needs more than one plate-readable crop near the line.
+        Ranking only by whole-vehicle sharpness can otherwise fill the buffer
+        with small early views. The two newest observations are protected;
+        remaining capacity is filled by the strongest older candidates.
+        Memory remains strictly bounded by ``candidates_per_track``.
+        """
+
         limit = self.config.candidates_per_track
-        if len(state.candidates) < limit:
-            state.candidates.append(candidate)
-            state.candidates.sort(key=self._candidate_rank, reverse=True)
-            return True
+        pool = [*state.candidates, candidate]
 
-        worst = state.candidates[-1]
-        if self._candidate_rank(candidate) <= self._candidate_rank(worst):
-            return False
+        recent_limit = min(2, limit)
+        selected = sorted(
+            pool,
+            key=lambda item: (
+                item.frame_index,
+                *self._candidate_rank(item),
+            ),
+            reverse=True,
+        )[:recent_limit]
 
-        state.candidates[-1] = candidate
-        state.candidates.sort(key=self._candidate_rank, reverse=True)
-        return True
+        selected_ids = {id(item) for item in selected}
+        historical = sorted(
+            (
+                item
+                for item in pool
+                if id(item) not in selected_ids
+            ),
+            key=self._candidate_rank,
+            reverse=True,
+        )
+        for item in historical:
+            if len(selected) >= limit:
+                break
+            selected.append(item)
+
+        selected.sort(key=self._candidate_rank, reverse=True)
+        state.candidates = selected
+        return any(item is candidate for item in selected)
 
     @staticmethod
     def _candidate_rank(candidate: VehicleFrameCandidate) -> tuple[float, int]:

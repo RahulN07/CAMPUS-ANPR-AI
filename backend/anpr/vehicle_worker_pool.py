@@ -161,16 +161,20 @@ class VehicleWorkerPool(Generic[TaskType]):
             raise ValueError("timeout cannot be negative")
 
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._condition:
-            while not self._is_idle_unlocked():
+
+        # Queue owns the authoritative accepted-task counter. It increments
+        # inside put() before a worker can consume the item and reaches zero
+        # only after task_done(), which we call after processing and callbacks.
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
                 if deadline is None:
-                    self._condition.wait()
+                    self._queue.all_tasks_done.wait()
                     continue
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self._condition.wait(remaining)
+                self._queue.all_tasks_done.wait(remaining)
             return True
 
     def stop(
@@ -351,9 +355,6 @@ class VehicleWorkerPool(Generic[TaskType]):
         with self._condition:
             self._discarded_on_stop += discarded
             self._condition.notify_all()
-
-    def _is_idle_unlocked(self) -> bool:
-        return self._queue.empty() and self._in_flight == 0
 
     @staticmethod
     def _remaining(deadline: float | None) -> float | None:
