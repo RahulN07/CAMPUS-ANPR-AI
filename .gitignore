@@ -1,0 +1,70 @@
+# -----------------------
+# Python
+# -----------------------
+backend/.venv/
+backend/__pycache__/
+backend/**/*.pyc
+backend/db.sqlite3
+__pycache__/
+*.py[cod]
+
+# -----------------------
+# Django
+# -----------------------
+backend/media/
+backend/staticfiles/
+
+# -----------------------
+# Environment
+# -----------------------
+backend/.env
+.env
+.env.*
+
+# -----------------------
+# Node
+# -----------------------
+frontend/node_modules/
+frontend/dist/
+
+# -----------------------
+# YOLO Dataset
+# -----------------------
+dataset_merged/
+dataset/
+datasets/
+
+# -----------------------
+# YOLO Training Output
+# -----------------------
+runs/
+
+# -----------------------
+# Backup
+# -----------------------
+backup/
+
+# -----------------------
+# Generated Files
+# -----------------------
+structure.txt
+frontend/src/structure.txt
+
+# Duplicate model at project root
+/yolov8n.pt
+
+# -----------------------
+# VS Code
+# -----------------------
+.vscode/
+
+# -----------------------
+# OS
+# -----------------------
+.DS_Store
+Thumbs.db
+
+
+backend/*.jpg
+backend/*.jpeg
+backend/*.png
