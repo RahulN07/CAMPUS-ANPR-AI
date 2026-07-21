@@ -1,12 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import Webcam from "react-webcam";
 import toast from "react-hot-toast";
 import {
   LuBuilding2,
   LuCamera,
   LuCar,
-  LuCheckCheck,
   LuClock,
   LuGauge,
   LuMapPin,
@@ -18,410 +16,361 @@ import {
   LuVideoOff,
 } from "react-icons/lu";
 
-import StatusBadge from "../components/StatusBadge";
 import EmptyState from "../components/EmptyState";
 import { SelectField } from "../components/FormField";
+import StatusBadge from "../components/StatusBadge";
+import { useLiveAnpr } from "../hooks/useLiveAnpr";
 import { useReferenceData } from "../hooks/useReferenceData";
-import { detectPlate, recentDetections } from "../services/anprService";
-import { formatTime, formatDateTime } from "../utils/format";
 import { resolveMediaUrl } from "../api/axios";
+import { recentDetections } from "../services/anprService";
+import { formatDateTime, formatTime } from "../utils/format";
 
-const DETECTION_INTERVAL_MS = 2500;
-const DUPLICATE_WINDOW_MS = 30000;
-const NO_PLATE_MESSAGE_MS = 2500;
 
-/**
- * Converts a react-webcam screenshot data URL into a File the backend
- * can accept as multipart/form-data, without round-tripping through
- * fetch().
- */
-function dataUrlToFile(dataUrl, filename = "frame.jpg") {
-  const [header, base64] = dataUrl.split(",");
-  const mimeMatch = header.match(/:(.*?);/);
-  const mime = mimeMatch ? mimeMatch[1] : "image/jpeg";
-
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  return new File([bytes], filename, { type: mime });
-}
-
-/**
- * Normalizes a DetectPlateView response into the same shape as the
- * records returned by GET recent-detections/ (EntryExitRecordSerializer),
- * so the recent-detections grid can render both without branching.
- */
-function toRecentRecord(detection) {
-  const attributes = detection.detected_vehicle_attributes || {};
-
+function normalizeStoredRecord(record) {
+  const vehicle = record.vehicle_detail || {};
+  const authorized = record.was_authorized === true;
   return {
-    id: detection.record_id,
-    detected_plate_text: detection.normalized_plate || detection.detected_plate,
-    timestamp: detection.timestamp,
-    captured_image: detection.captured_image,
-    was_authorized: detection.was_authorized,
-    confidence_score: detection.confidence_score,
-    direction: detection.direction,
-    detected_vehicle_type: attributes.vehicle_type,
-    vehicle_color: attributes.vehicle_color,
-    detected_vehicle_company: attributes.vehicle_company,
-    detected_vehicle_model: attributes.vehicle_model,
+    record_id: record.id,
+    track_id: null,
+    plate: record.detected_plate_text,
+    authorization_status: authorized ? "AUTHORIZED" : "UNAUTHORIZED",
+    authorized,
+    confidence: Number(record.confidence_score || 0),
+    owner: vehicle.owner_name || null,
+    owner_type: vehicle.owner_type || null,
+    department: vehicle.department_name || null,
+    company: vehicle.vehicle_company || record.detected_vehicle_company || null,
+    model: vehicle.vehicle_model || record.detected_vehicle_model || null,
+    color: vehicle.color || record.vehicle_color || null,
+    vehicle_type: vehicle.vehicle_type_display || record.detected_vehicle_type || null,
+    gate: record.gate_name || null,
+    direction: record.direction,
+    timestamp: record.timestamp,
+    captured_image: record.captured_image,
+    plate_image: record.plate_image,
+    diagnostic_only: false,
   };
 }
+
+
+function detectionIdentity(detection) {
+  if (detection?.record_id) return `record:${detection.record_id}`;
+  return [
+    detection?.plate || "unknown",
+    detection?.track_id ?? "track",
+    detection?.published_at || detection?.timestamp || "time",
+  ].join(":");
+}
+
+
+function timestampValue(detection) {
+  const value = Date.parse(detection?.timestamp || detection?.published_at || "");
+  return Number.isFinite(value) ? value : 0;
+}
+
 
 export default function LiveMonitor() {
   const { gates } = useReferenceData();
   const navigate = useNavigate();
-
-  // Refs
-  const webcamRef = useRef(null);
-  const intervalRef = useRef(null);
-  const requestInProgressRef = useRef(false);
-  const mountedRef = useRef(true);
-  const lastDetectionRef = useRef({ plate: null, timestamp: 0 });
-  const noPlateTimeoutRef = useRef(null);
-
-  // State
   const [selectedGate, setSelectedGate] = useState("");
-  const [cameraActive, setCameraActive] = useState(false);
-  const [cameraReady, setCameraReady] = useState(false);
-  const [detecting, setDetecting] = useState(false);
-  const [latestDetection, setLatestDetection] = useState(null);
-  const [recentDetectionsList, setRecentDetectionsList] = useState([]);
-  const [scanMessage, setScanMessage] = useState("");
-  const [error, setError] = useState("");
+  const [storedRecords, setStoredRecords] = useState([]);
 
-  const loadRecent = useCallback(async () => {
-    try {
-      const data = await recentDetections(25);
-      setRecentDetectionsList(Array.isArray(data) ? data : data.results || []);
-    } catch {
-      // Recent detections should not block the live monitor.
+  const notifyDetection = useCallback((detection) => {
+    const plate = detection.plate || "UNREADABLE";
+    if (detection.authorized) {
+      toast.success(`Access authorized — ${plate}`);
+    } else {
+      toast.error(`Unauthorized vehicle — ${plate}`);
     }
   }, []);
 
-  const stopCamera = useCallback(() => {
-    if (intervalRef.current) {
-      window.clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-
-    if (noPlateTimeoutRef.current) {
-      window.clearTimeout(noPlateTimeoutRef.current);
-      noPlateTimeoutRef.current = null;
-    }
-
-    const stream = webcamRef.current?.video?.srcObject;
-    if (stream) {
-      stream.getTracks().forEach((track) => track.stop());
-    }
-
-    requestInProgressRef.current = false;
-    setCameraActive(false);
-    setCameraReady(false);
-    setDetecting(false);
-    setScanMessage("");
-  }, []);
+  const live = useLiveAnpr(selectedGate, {
+    maximumEvents: 25,
+    onDetection: notifyDetection,
+  });
 
   useEffect(() => {
-    mountedRef.current = true;
-    loadRecent();
-
+    let active = true;
+    recentDetections(25)
+      .then((data) => {
+        if (!active) return;
+        const records = Array.isArray(data) ? data : data?.results || [];
+        setStoredRecords(records.map(normalizeStoredRecord));
+      })
+      .catch(() => {
+        // Historical activity must never block the live transport.
+      });
     return () => {
-      mountedRef.current = false;
-      stopCamera();
+      active = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const captureAndDetect = useCallback(async () => {
-    if (requestInProgressRef.current) return;
-    if (!webcamRef.current) return;
-
-    const screenshot = webcamRef.current.getScreenshot();
-    if (!screenshot) return;
-
-    requestInProgressRef.current = true;
-    setDetecting(true);
-
-    try {
-      const frameFile = dataUrlToFile(screenshot);
-
-      const data = await detectPlate({
-        image: frameFile,
-        gate: selectedGate || undefined,
-        source: "WEBCAM",
-      });
-
-      if (!mountedRef.current) return;
-
-      setError("");
-
-      if (!data.success) {
-        setScanMessage("No plate detected");
-
-        if (noPlateTimeoutRef.current) window.clearTimeout(noPlateTimeoutRef.current);
-        noPlateTimeoutRef.current = window.setTimeout(() => {
-          if (mountedRef.current) setScanMessage("");
-        }, NO_PLATE_MESSAGE_MS);
-
-        return;
-      }
-
-      setScanMessage("");
-      setLatestDetection(data);
-
-      const plate = data.normalized_plate;
-      const now = Date.now();
-
-      const isDuplicate =
-        data.duplicate_skipped ||
-        (plate &&
-          lastDetectionRef.current.plate === plate &&
-          now - lastDetectionRef.current.timestamp < DUPLICATE_WINDOW_MS);
-
-      if (!isDuplicate) {
-        lastDetectionRef.current = { plate, timestamp: now };
-
-        setRecentDetectionsList((current) => [toRecentRecord(data), ...current].slice(0, 25));
-
-        if (data.was_authorized) {
-          toast.success(`Access authorized \u2014 ${plate}`);
-        } else {
-          toast.error(`Unauthorized vehicle \u2014 ${plate}`);
-        }
-      }
-    } catch (requestError) {
-      console.error("Detection request failed:", requestError);
-      if (mountedRef.current) {
-        setError("Detection request failed. Still scanning\u2026");
-      }
-    } finally {
-      requestInProgressRef.current = false;
-      if (mountedRef.current) setDetecting(false);
+  const activity = useMemo(() => {
+    const merged = new Map();
+    for (const detection of [...live.recentEvents, ...storedRecords]) {
+      const key = detectionIdentity(detection);
+      if (!merged.has(key)) merged.set(key, detection);
     }
-  }, [selectedGate]);
+    return [...merged.values()]
+      .sort((first, second) => timestampValue(second) - timestampValue(first))
+      .slice(0, 25);
+  }, [live.recentEvents, storedRecords]);
 
-  function handleStartCamera() {
+  const selectedGateDetails = gates.find(
+    (item) => String(item.id) === String(selectedGate),
+  );
+  const latest = live.latestDetection || activity[0] || null;
+  const resultConfidence = Math.round(Number(latest?.confidence || 0) * 100);
+  const needsReview = resultConfidence > 0 && resultConfidence < 75;
+
+  const authorizationCounts = useMemo(
+    () => ({
+      authorized: activity.filter((item) => item.authorized).length,
+      unauthorized: activity.filter((item) => !item.authorized).length,
+    }),
+    [activity],
+  );
+
+  function handleStart() {
     if (!selectedGate) {
-      toast.error("Select a gate before starting the camera");
+      toast.error("Select a gate before starting live monitoring");
       return;
     }
-
-    setError("");
-    setLatestDetection(null);
-    setCameraActive(true);
-
-    intervalRef.current = window.setInterval(() => {
-      captureAndDetect();
-    }, DETECTION_INTERVAL_MS);
+    live.start();
   }
 
-  function handleStopCamera() {
-    stopCamera();
+  function handleStop() {
+    live.stop();
   }
 
-  const statistics = useMemo(() => {
-    const authorized = recentDetectionsList.filter((r) => r.was_authorized).length;
-    const unauthorized = recentDetectionsList.filter((r) => !r.was_authorized).length;
+  const connectionLabel = {
+    idle: "Monitor Stopped",
+    connecting: "Connecting",
+    connected: "Transport Connected",
+    disconnected: "Reconnecting",
+    unauthorized: "Session Expired",
+  }[live.connectionState] || "Disconnected";
 
-    const needsReview = recentDetectionsList.filter((r) => {
-      const confidence = Number(r.confidence_score || 0);
-      return confidence > 0 && confidence < 0.75;
-    }).length;
-
-    return {
-      total: recentDetectionsList.length,
-      authorized,
-      unauthorized,
-      needsReview,
-    };
-  }, [recentDetectionsList]);
-
-  const selectedGateDetails = gates.find((item) => String(item.id) === String(selectedGate));
-
-  const resultAuthorized = latestDetection?.was_authorized === true;
-
-  const resultConfidence = Math.round(Number(latestDetection?.confidence_score || 0) * 100);
-
-  const attributes = latestDetection?.detected_vehicle_attributes;
+  const pipelineLabel = {
+    RUNNING: "CCTV Running",
+    WARMING: "AI Warming Up",
+    STOPPED: "CCTV Stopped",
+    ERROR: "Pipeline Error",
+    OFFLINE: "Waiting for CCTV",
+    IDLE: "Monitor Stopped",
+  }[live.pipelineState] || live.pipelineState;
 
   return (
     <div className="space-y-6 animate-fadeIn">
-      {/* Top controls */}
       <div className="flex flex-wrap items-center gap-3">
         <SelectField
           placeholder="Select a gate"
-          options={gates.map((item) => ({
-            value: item.id,
-            label: item.name,
-          }))}
+          options={gates.map((item) => ({ value: item.id, label: item.name }))}
           value={selectedGate}
           onChange={(event) => setSelectedGate(event.target.value)}
-          disabled={cameraActive}
+          disabled={live.monitoring}
           className="w-56"
         />
 
-        {!cameraActive ? (
+        {!live.monitoring ? (
           <button
             type="button"
-            onClick={handleStartCamera}
+            onClick={handleStart}
             className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
           >
             <LuCamera size={16} />
-            Start Camera
+            Connect Live Monitor
           </button>
         ) : (
           <button
             type="button"
-            onClick={handleStopCamera}
+            onClick={handleStop}
             className="inline-flex items-center gap-2 rounded-xl bg-red-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-red-700"
           >
             <LuVideoOff size={16} />
-            Stop Camera
+            Disconnect Monitor
           </button>
         )}
 
         <div
           className={`ml-auto flex items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold ${
-            cameraActive
+            live.connectionState === "connected"
               ? "border-emerald-100 bg-emerald-50 text-emerald-700"
-              : "border-slate-100 bg-slate-50 text-slate-500"
+              : live.monitoring
+                ? "border-amber-100 bg-amber-50 text-amber-700"
+                : "border-slate-100 bg-slate-50 text-slate-500"
           }`}
         >
           <span
             className={`h-2 w-2 rounded-full ${
-              cameraActive ? "bg-emerald-500 animate-pulse" : "bg-slate-300"
+              live.connectionState === "connected"
+                ? "bg-emerald-500 animate-pulse"
+                : live.monitoring
+                  ? "bg-amber-500 animate-pulse"
+                  : "bg-slate-300"
             }`}
           />
-          {cameraActive ? "Scanning Automatically" : "Camera Stopped"}
+          {connectionLabel}
         </div>
       </div>
 
-      {error && (
-        <div className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-          <LuTriangleAlert size={16} className="shrink-0" />
-          {error}
+      {live.error && (
+        <div className="flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
+          <span className="flex items-center gap-2">
+            <LuTriangleAlert size={16} className="shrink-0" />
+            {live.error}
+          </span>
+          <button
+            type="button"
+            onClick={live.clearError}
+            className="text-xs font-bold uppercase tracking-wide"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
-      {/* Statistics */}
       <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
-        <MonitorStatCard title="Recent Scans" value={statistics.total} icon={LuScanLine} tone="blue" />
-        <MonitorStatCard title="Authorized" value={statistics.authorized} icon={LuShieldCheck} tone="green" />
-        <MonitorStatCard title="Unauthorized" value={statistics.unauthorized} icon={LuShieldAlert} tone="red" />
-        <MonitorStatCard title="Needs Review" value={statistics.needsReview} icon={LuTriangleAlert} tone="amber" />
+        <MonitorStatCard
+          title="Processing FPS"
+          value={live.metrics.fps.toFixed(1)}
+          detail={`Target ${live.metrics.targetFps}`}
+          icon={LuGauge}
+          tone="blue"
+        />
+        <MonitorStatCard
+          title="Vehicles in Frame"
+          value={live.metrics.vehicleCount}
+          detail={`${live.metrics.trackedCount} tracked`}
+          icon={LuCar}
+          tone="green"
+        />
+        <MonitorStatCard
+          title="Frame Queue"
+          value={`${live.metrics.frameQueueSize}/${live.metrics.frameQueueCapacity}`}
+          detail={`${live.metrics.frameQueueDropped} dropped`}
+          icon={LuScanLine}
+          tone="amber"
+        />
+        <MonitorStatCard
+          title="Vehicle Queue"
+          value={`${live.metrics.vehicleQueueSize}/${live.metrics.vehicleQueueCapacity}`}
+          detail={`${live.metrics.workerInFlight}/${live.metrics.workerCount} workers busy`}
+          icon={LuClock}
+          tone="red"
+        />
       </div>
 
-      {/* Main monitor */}
       <div className="grid gap-6 xl:grid-cols-3">
         <div className="space-y-6 xl:col-span-2">
-          <div className="relative overflow-hidden rounded-2xl border border-slate-100 bg-white shadow-card">
-            {/* Camera information overlay */}
-            {cameraActive && (
+          <section className="relative overflow-hidden rounded-2xl border border-slate-100 bg-white shadow-card">
+            {live.monitoring && (
               <div className="pointer-events-none absolute left-4 top-4 z-20 flex flex-wrap gap-2">
-                <div className="flex items-center gap-2 rounded-full bg-slate-950/75 px-3 py-1.5 text-xs font-semibold text-white backdrop-blur">
-                  <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                  LIVE
+                <div
+                  className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-semibold text-white backdrop-blur ${
+                    live.isLive ? "bg-emerald-600/90" : "bg-slate-950/75"
+                  }`}
+                >
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      live.isLive ? "bg-white animate-pulse" : "bg-amber-400"
+                    }`}
+                  />
+                  {pipelineLabel}
                 </div>
-
                 <div className="rounded-full bg-slate-950/75 px-3 py-1.5 text-xs font-medium text-white backdrop-blur">
                   {selectedGateDetails?.name || "Gate"}
                 </div>
-
-                {detecting && (
-                  <div className="hidden items-center gap-1.5 rounded-full bg-blue-600/90 px-3 py-1.5 text-xs font-medium text-white backdrop-blur sm:flex">
-                    <LuScanLine size={13} className="animate-pulse" />
-                    Analyzing frame
+                {live.isLive && (
+                  <div className="rounded-full bg-slate-950/75 px-3 py-1.5 text-xs font-medium text-white backdrop-blur">
+                    {live.metrics.fps.toFixed(1)} FPS · {live.metrics.vehicleCount} vehicles
                   </div>
                 )}
               </div>
             )}
 
-            {scanMessage && cameraActive && (
-              <div className="pointer-events-none absolute bottom-4 left-1/2 z-20 -translate-x-1/2 rounded-full bg-slate-950/75 px-4 py-1.5 text-xs font-medium text-white backdrop-blur">
-                {scanMessage}
-              </div>
-            )}
-
             <div className="aspect-video w-full bg-slate-950">
-              {cameraActive ? (
-                <Webcam
-                  ref={webcamRef}
-                  audio={false}
-                  screenshotFormat="image/jpeg"
-                  videoConstraints={{ facingMode: "environment" }}
-                  onUserMedia={() => setCameraReady(true)}
-                  onUserMediaError={() => {
-                    setError("Camera access denied or unavailable.");
-                    stopCamera();
-                  }}
-                  className="h-full w-full object-cover"
+              {live.frameUrl ? (
+                <img
+                  src={live.frameUrl}
+                  alt={`Live ANPR feed for ${selectedGateDetails?.name || "gate"}`}
+                  className="h-full w-full object-contain"
                 />
               ) : (
-                <div className="grid h-full w-full place-items-center text-slate-500">
-                  <div className="text-center">
-                    <LuVideoOff size={32} className="mx-auto mb-2 opacity-60" />
-                    <p className="text-sm font-medium">Camera stopped</p>
-                    <p className="mt-1 text-xs text-slate-600">
-                      Select a gate and press Start Camera
+                <div className="grid h-full w-full place-items-center px-6 text-slate-400">
+                  <div className="max-w-md text-center">
+                    {live.monitoring ? (
+                      <LuScanLine size={36} className="mx-auto mb-3 animate-pulse text-blue-400" />
+                    ) : (
+                      <LuVideoOff size={36} className="mx-auto mb-3 opacity-60" />
+                    )}
+                    <p className="text-sm font-semibold text-slate-200">{pipelineLabel}</p>
+                    <p className="mt-1 text-xs leading-5 text-slate-500">
+                      {live.monitoring
+                        ? "The monitor is connected. Start the CCTV ANPR worker for this gate to receive annotated frames."
+                        : "Select a gate and connect to its continuous CCTV pipeline."}
                     </p>
                   </div>
                 </div>
               )}
             </div>
 
-            {cameraActive && !cameraReady && (
-              <div className="absolute inset-0 z-30 grid place-items-center bg-slate-950/60 backdrop-blur-[2px]">
-                <p className="text-sm font-medium text-white">Starting camera\u2026</p>
-              </div>
-            )}
-          </div>
+            <div className="grid grid-cols-2 gap-px border-t border-slate-800 bg-slate-800 text-xs sm:grid-cols-4">
+              <StreamMetric label="Crossings" value={live.metrics.lineCrossings} />
+              <StreamMetric label="Records saved" value={live.metrics.recordsSaved} />
+              <StreamMetric label="Camera reconnects" value={live.metrics.reconnects} />
+              <StreamMetric
+                label="Transport"
+                value={live.connectionState === "connected" ? "Healthy" : "Waiting"}
+              />
+            </div>
+          </section>
 
-          {/* Recent detections */}
-          <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-card">
-            <div className="mb-4 flex items-center justify-between">
+          <section className="rounded-2xl border border-slate-100 bg-white p-5 shadow-card">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h3 className="font-display font-semibold text-ink-950">Recent Detections</h3>
-                <p className="mt-1 text-xs text-slate-400">Latest ANPR activity from connected cameras</p>
+                <h3 className="font-display font-semibold text-ink-950">Recent Activity</h3>
+                <p className="mt-1 text-xs text-slate-400">
+                  New vehicle events appear instantly without refreshing
+                </p>
               </div>
-
-              <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">
-                {recentDetectionsList.length} records
-              </span>
+              <div className="flex items-center gap-2 text-xs font-semibold">
+                <span className="rounded-full bg-emerald-50 px-3 py-1 text-emerald-700">
+                  {authorizationCounts.authorized} authorized
+                </span>
+                <span className="rounded-full bg-red-50 px-3 py-1 text-red-700">
+                  {authorizationCounts.unauthorized} unauthorized
+                </span>
+              </div>
             </div>
 
-            {recentDetectionsList.length === 0 ? (
-              <EmptyState title="No detections yet" message="Detected plates will appear here." />
+            {activity.length === 0 ? (
+              <EmptyState title="No detections yet" message="Recognized vehicles will appear here." />
             ) : (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
-                {recentDetectionsList.slice(0, 10).map((record, index) => {
-                  const confidence = Math.round(Number(record.confidence_score || 0) * 100);
-                  const needsReview = confidence > 0 && confidence < 75;
-
+                {activity.slice(0, 10).map((detection, index) => {
+                  const confidence = Math.round(Number(detection.confidence || 0) * 100);
+                  const review = confidence > 0 && confidence < 75;
                   return (
                     <article
-                      key={record.id ?? `${record.detected_plate_text}-${record.timestamp}`}
-                      onClick={() => record.id && navigate(`/records/${record.id}`)}
-                      className={`group relative cursor-pointer overflow-hidden rounded-xl border bg-white transition duration-200 hover:-translate-y-1 hover:shadow-lg ${
-                        index === 0 ? "border-blue-300 ring-2 ring-blue-100" : "border-slate-100"
-                      }`}
+                      key={detectionIdentity(detection)}
+                      onClick={() =>
+                        detection.record_id && navigate(`/records/${detection.record_id}`)
+                      }
+                      className={`group relative overflow-hidden rounded-xl border bg-white transition duration-200 hover:-translate-y-1 hover:shadow-lg ${
+                        detection.record_id ? "cursor-pointer" : "cursor-default"
+                      } ${index === 0 ? "border-blue-300 ring-2 ring-blue-100" : "border-slate-100"}`}
                     >
                       {index === 0 && (
                         <span className="absolute left-2 top-2 z-10 rounded-full bg-blue-600 px-2 py-1 text-[9px] font-bold uppercase tracking-wide text-white shadow">
-                          New
+                          Latest
                         </span>
                       )}
-
                       <div className="aspect-video overflow-hidden bg-slate-100">
-                        {record.captured_image ? (
+                        {detection.captured_image ? (
                           <img
-                            src={resolveMediaUrl(record.captured_image)}
-                            alt={record.detected_plate_text || "Detected vehicle"}
+                            src={resolveMediaUrl(detection.captured_image)}
+                            alt={detection.plate || "Detected vehicle"}
                             className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
                           />
                         ) : (
@@ -430,34 +379,28 @@ export default function LiveMonitor() {
                           </div>
                         )}
                       </div>
-
                       <div className="space-y-2 p-3">
                         <div>
-                          <p
-                            className="truncate text-sm font-extrabold tracking-wide text-ink-950"
-                            title={record.detected_plate_text}
-                          >
-                            {record.detected_plate_text || "UNREADABLE"}
+                          <p className="truncate text-sm font-extrabold tracking-wide text-ink-950">
+                            {detection.plate || "UNREADABLE"}
                           </p>
-
                           <p className="mt-0.5 text-[11px] text-slate-400">
-                            {formatTime(record.timestamp)}
-                            {record.direction ? ` \u00b7 ${record.direction}` : ""}
+                            {formatTime(detection.timestamp || detection.published_at)}
+                            {detection.direction ? ` · ${detection.direction}` : ""}
                           </p>
                         </div>
-
                         <div className="flex items-center justify-between gap-2">
-                          {needsReview ? (
+                          {review ? (
                             <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] font-semibold text-amber-700">
-                              <LuTriangleAlert size={10} />
-                              Review
+                              <LuTriangleAlert size={10} /> Review
                             </span>
                           ) : (
-                            <StatusBadge status={record.was_authorized ? "AUTHORIZED" : "UNAUTHORIZED"} />
+                            <StatusBadge status={detection.authorization_status} />
                           )}
-
                           {confidence > 0 && (
-                            <span className="text-[10px] font-semibold text-slate-400">{confidence}%</span>
+                            <span className="text-[10px] font-semibold text-slate-400">
+                              {confidence}%
+                            </span>
                           )}
                         </div>
                       </div>
@@ -466,21 +409,19 @@ export default function LiveMonitor() {
                 })}
               </div>
             )}
-          </div>
+          </section>
         </div>
 
-        {/* Detected vehicle panel */}
         <aside className="h-fit rounded-2xl border border-slate-100 bg-white p-5 shadow-card xl:sticky xl:top-6">
           <div className="mb-5 flex items-center justify-between">
             <div>
-              <h3 className="font-display font-semibold text-ink-950">Detected Vehicle</h3>
-              <p className="mt-1 text-xs text-slate-400">Latest scan result</p>
+              <h3 className="font-display font-semibold text-ink-950">Latest Detection</h3>
+              <p className="mt-1 text-xs text-slate-400">Most recent recognized vehicle</p>
             </div>
-
             <div
               className={`grid h-10 w-10 place-items-center rounded-xl ${
-                latestDetection?.success
-                  ? resultAuthorized
+                latest
+                  ? latest.authorized
                     ? "bg-emerald-50 text-emerald-600"
                     : "bg-red-50 text-red-600"
                   : "bg-slate-100 text-slate-400"
@@ -490,109 +431,92 @@ export default function LiveMonitor() {
             </div>
           </div>
 
-          {!latestDetection && !detecting && (
+          {!latest ? (
             <EmptyState
-              title="Waiting for a scan"
-              message="Start the camera to see vehicle details as plates are detected."
+              title="Waiting for a vehicle"
+              message="Vehicle and owner details will appear after a line crossing."
             />
-          )}
-
-          {latestDetection && latestDetection.success && (
+          ) : (
             <div className="space-y-5">
-              {/* Plate */}
               <div
                 className={`rounded-2xl border p-4 ${
-                  resultAuthorized ? "border-emerald-100 bg-emerald-50/70" : "border-red-100 bg-red-50/70"
+                  latest.authorized
+                    ? "border-emerald-100 bg-emerald-50/70"
+                    : "border-red-100 bg-red-50/70"
                 }`}
               >
-                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400">Number plate</p>
-
+                <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-slate-400">
+                  Number plate
+                </p>
                 <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
                   <p className="font-display text-2xl font-black tracking-wider text-ink-950">
-                    {latestDetection.normalized_plate || "UNREADABLE"}
+                    {latest.plate || "UNREADABLE"}
                   </p>
-
-                  <StatusBadge status={latestDetection.authorization_status} />
+                  <StatusBadge status={latest.authorization_status} />
                 </div>
               </div>
 
-              {/* Information */}
               <div className="space-y-2">
-                <VehicleInfoRow
-                  icon={LuCar}
-                  label="Vehicle type"
-                  value={attributes?.vehicle_type || "Unknown"}
-                />
-
-                <VehicleInfoRow icon={LuPalette} label="Color" value={attributes?.vehicle_color || "Unknown"} />
-
+                <VehicleInfoRow icon={LuCar} label="Vehicle type" value={latest.vehicle_type || "Unknown"} />
+                <VehicleInfoRow icon={LuPalette} label="Color" value={latest.color || "Unknown"} />
                 <VehicleInfoRow
                   icon={LuBuilding2}
                   label="Company / Model"
-                  value={
-                    attributes?.vehicle_company && attributes.vehicle_company !== "Unknown"
-                      ? `${attributes.vehicle_company} ${attributes.vehicle_model || ""}`.trim()
-                      : "Unknown"
-                  }
+                  value={[latest.company, latest.model].filter(Boolean).join(" ") || "Unknown"}
                 />
-
+                <VehicleInfoRow icon={LuBuilding2} label="Owner" value={latest.owner || "No owner on record"} />
+                <VehicleInfoRow icon={LuBuilding2} label="Department" value={latest.department || "Not registered"} />
+                <VehicleInfoRow icon={LuMapPin} label="Gate" value={latest.gate || selectedGateDetails?.name || "—"} />
                 <VehicleInfoRow
-                  icon={LuBuilding2}
-                  label="Owner"
-                  value={latestDetection.vehicle?.owner_name || "No owner on record"}
+                  icon={LuClock}
+                  label="Detected at"
+                  value={formatDateTime(latest.timestamp || latest.published_at)}
                 />
-
                 <VehicleInfoRow
-                  icon={LuMapPin}
-                  label="Gate"
-                  value={selectedGateDetails?.name || "\u2014"}
+                  icon={LuScanLine}
+                  label="Track / Direction"
+                  value={`${latest.track_id ? `ID ${latest.track_id}` : "Stored record"} · ${latest.direction || "—"}`}
                 />
-
-                <VehicleInfoRow icon={LuClock} label="Detected at" value={formatDateTime(new Date())} />
-
-                <VehicleInfoRow icon={LuGauge} label="Plate confidence" value={`${resultConfidence}%`} />
               </div>
 
-              {/* Confidence bar */}
               <div>
                 <div className="mb-2 flex items-center justify-between text-xs">
-                  <span className="font-medium text-slate-500">OCR confidence</span>
+                  <span className="font-medium text-slate-500">Plate confidence</span>
                   <span className="font-bold text-slate-700">{resultConfidence}%</span>
                 </div>
-
                 <div className="h-2 overflow-hidden rounded-full bg-slate-100">
                   <div
                     className={`h-full rounded-full transition-all duration-700 ${
-                      resultConfidence < 75
+                      needsReview
                         ? "bg-amber-500"
-                        : resultAuthorized
-                        ? "bg-emerald-500"
-                        : "bg-red-500"
+                        : latest.authorized
+                          ? "bg-emerald-500"
+                          : "bg-red-500"
                     }`}
                     style={{ width: `${Math.min(resultConfidence, 100)}%` }}
                   />
                 </div>
               </div>
 
-              {resultConfidence > 0 && resultConfidence < 75 && (
+              {needsReview && (
                 <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700">
                   <LuTriangleAlert size={16} className="mt-0.5 shrink-0" />
-                  <span>This result has low confidence and should be reviewed before taking action.</span>
+                  <span>This plate requires manual review because its recognition confidence is low.</span>
                 </div>
               )}
 
-              {latestDetection.duplicate_skipped ? (
-                <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-3 text-xs font-semibold text-slate-500">
-                  Duplicate scan \u2014 no new record created
-                </div>
-              ) : (
-                latestDetection.record_created && (
-                  <div className="flex items-center gap-2 rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-3 text-xs font-semibold text-emerald-700">
-                    <LuCheckCheck size={16} />
-                    {latestDetection.direction === "EXIT" ? "Exit recorded successfully" : "Entry recorded successfully"}
-                  </div>
-                )
-              )}
+              <div
+                className={`flex items-center gap-2 rounded-xl border px-3 py-3 text-xs font-semibold ${
+                  latest.authorized
+                    ? "border-emerald-100 bg-emerald-50 text-emerald-700"
+                    : "border-red-100 bg-red-50 text-red-700"
+                }`}
+              >
+                {latest.authorized ? <LuShieldCheck size={16} /> : <LuShieldAlert size={16} />}
+                {latest.authorized
+                  ? "Authorized vehicle — access recorded"
+                  : "Unknown or unauthorized vehicle — security review required"}
+              </div>
             </div>
           )}
         </aside>
@@ -601,23 +525,23 @@ export default function LiveMonitor() {
   );
 }
 
-function MonitorStatCard({ title, value, icon: Icon, tone }) {
+
+function MonitorStatCard({ title, value, detail, icon: Icon, tone }) {
   const styles = {
     blue: "bg-blue-50 text-blue-600 border-blue-100",
     green: "bg-emerald-50 text-emerald-600 border-emerald-100",
     red: "bg-red-50 text-red-600 border-red-100",
     amber: "bg-amber-50 text-amber-600 border-amber-100",
   };
-
   return (
     <div className="rounded-2xl border border-slate-100 bg-white p-4 shadow-card transition hover:-translate-y-0.5 hover:shadow-lg">
       <div className="flex items-center justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <p className="text-xs font-medium text-slate-500">{title}</p>
-          <p className="mt-1 font-display text-2xl font-black text-ink-950">{value}</p>
+          <p className="mt-1 truncate font-display text-2xl font-black text-ink-950">{value}</p>
+          <p className="mt-1 truncate text-[11px] font-medium text-slate-400">{detail}</p>
         </div>
-
-        <div className={`grid h-11 w-11 place-items-center rounded-xl border ${styles[tone] || styles.blue}`}>
+        <div className={`grid h-11 w-11 shrink-0 place-items-center rounded-xl border ${styles[tone] || styles.blue}`}>
           <Icon size={21} />
         </div>
       </div>
@@ -625,16 +549,26 @@ function MonitorStatCard({ title, value, icon: Icon, tone }) {
   );
 }
 
+
+function StreamMetric({ label, value }) {
+  return (
+    <div className="bg-slate-950 px-4 py-3 text-center">
+      <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500">{label}</p>
+      <p className="mt-1 font-bold text-slate-200">{value}</p>
+    </div>
+  );
+}
+
+
 function VehicleInfoRow({ icon: Icon, label, value }) {
   return (
     <div className="flex items-center gap-3 rounded-xl border border-slate-100 bg-slate-50/70 p-3">
       <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-white text-slate-500 shadow-sm">
         <Icon size={16} />
       </div>
-
       <div className="min-w-0">
         <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{label}</p>
-        <p className="truncate text-sm font-semibold capitalize text-slate-700">{value}</p>
+        <p className="truncate text-sm font-semibold text-slate-700">{value}</p>
       </div>
     </div>
   );

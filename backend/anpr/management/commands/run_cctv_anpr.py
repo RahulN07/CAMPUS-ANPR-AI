@@ -1,17 +1,24 @@
+# Phase 5 smooth-preview command: capture/preview is decoupled from tracking.
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 import numpy as np
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.utils import timezone
 
 from access_management.models import Gate
 from accounts.models import User
 from anpr.camera_capture import CameraCaptureService
 from anpr.detector import detect_plate_bboxes, run_ocr
+from anpr.live_publisher import (
+    AnprLivePublisher,
+    LivePublisherConfig,
+)
 from anpr.tracking_pipeline import (
     CameraTrackingPipeline,
     TrackingPipelineConfig,
@@ -172,7 +179,11 @@ class Command(BaseCommand):
         diagnostic_only = bool(options["diagnostic_only"])
         tracker_config_name = str(
             options.get("tracker")
-            or getattr(settings, "ANPR_TRACKER_CONFIG", "bytetrack.yaml")
+            or getattr(
+                settings,
+                "ANPR_CCTV_TRACKER_CONFIG",
+                getattr(settings, "ANPR_TRACKER_CONFIG", "bytetrack.yaml"),
+            )
         )
         built_in_trackers = {"bytetrack.yaml", "botsort.yaml"}
         if tracker_config_name not in built_in_trackers:
@@ -188,6 +199,16 @@ class Command(BaseCommand):
         self._latest_activity: VehicleProcessingResult | None = None
         self._latest_activity_until = 0.0
         self._diagnostic_only = diagnostic_only
+        self._gate = gate
+        self._direction = direction
+        self._live_publisher = AnprLivePublisher(
+            gate_id=gate.id,
+            config=LivePublisherConfig(
+                frame_queue_size=1,
+                detection_queue_size=vehicle_queue_size,
+                thread_name_prefix=f"anpr-live-gate-{gate.id}",
+            ),
+        )
 
         cache = get_vehicle_cache()
         duplicate_guard = RecentPlateGuard(cooldown)
@@ -256,10 +277,26 @@ class Command(BaseCommand):
         capture_service = None
         latest_frame = None
         latest_frame_result = None
+        latest_preview = None
         latest_frame_time = None
         smoothed_fps = 0.0
+        tracking_executor = None
+        tracking_future = None
+        next_status_at = 0.0
+        shutdown_state = "STOPPED"
+        shutdown_error = ""
 
         try:
+            self._live_publisher.start()
+            self._live_publisher.submit_status(
+                self._build_live_status(
+                    state="WARMING",
+                    pipeline=pipeline,
+                    capture_service=None,
+                    frame_result=None,
+                    fps=0.0,
+                )
+            )
             pipeline.start()
             # Load weights and execute one dummy inference for every cold AI
             # path before opening the camera. Model construction and oneDNN
@@ -275,6 +312,10 @@ class Command(BaseCommand):
                 replay_video_in_real_time=is_video_file,
                 reconnect_delay=2.0,
             ).start()
+            tracking_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"anpr-tracking-gate-{gate.id}",
+            )
 
             self._print_startup(
                 gate=gate,
@@ -292,58 +333,106 @@ class Command(BaseCommand):
             )
 
             while True:
+                if tracking_future is not None and tracking_future.done():
+                    try:
+                        latest_frame_result = tracking_future.result()
+                    except Exception as error:
+                        self._write_error(
+                            f"Tracking frame failed: {error}"
+                        )
+                    else:
+                        completed_at = time.perf_counter()
+                        if latest_frame_time is not None:
+                            instantaneous = 1.0 / max(
+                                completed_at - latest_frame_time,
+                                1e-6,
+                            )
+                            smoothed_fps = (
+                                instantaneous
+                                if smoothed_fps <= 0
+                                else smoothed_fps * 0.8
+                                + instantaneous * 0.2
+                            )
+                        latest_frame_time = completed_at
+                    finally:
+                        tracking_future = None
+
                 packet = None
                 try:
-                    packet = capture_service.get_frame(timeout=0.05)
+                    packet = self._get_latest_capture_packet(
+                        capture_service,
+                        timeout=0.05,
+                    )
                 except queue.Empty:
                     packet = None
 
                 if packet is not None:
                     try:
                         latest_frame = packet.frame
-                        captured_at = getattr(packet, "captured_at", None)
+                        captured_at = getattr(
+                            packet,
+                            "captured_monotonic",
+                            getattr(packet, "captured_at", None),
+                        )
                         if not isinstance(captured_at, (int, float)):
                             captured_at = None
 
-                        latest_frame_result = pipeline.process_frame(
-                            frame=latest_frame,
-                            frame_index=packet.sequence,
-                            captured_at=captured_at,
-                        )
+                        if tracking_future is None:
+                            tracking_future = tracking_executor.submit(
+                                pipeline.process_frame,
+                                frame=latest_frame.copy(),
+                                frame_index=packet.sequence,
+                                captured_at=captured_at,
+                            )
 
                         now = time.perf_counter()
-                        if latest_frame_time is not None:
-                            instantaneous = 1.0 / max(
-                                now - latest_frame_time,
-                                1e-6,
+
+                        latest_preview = latest_frame.copy()
+                        self.draw_tracking_preview(
+                            frame=latest_preview,
+                            pipeline=pipeline,
+                            frame_result=latest_frame_result,
+                            fps=smoothed_fps,
+                        )
+                        self._submit_live_frame(
+                            frame=latest_preview,
+                            pipeline=pipeline,
+                            frame_result=latest_frame_result,
+                            fps=smoothed_fps,
+                        )
+
+                        if now >= next_status_at:
+                            self._live_publisher.submit_status(
+                                self._build_live_status(
+                                    state="RUNNING",
+                                    pipeline=pipeline,
+                                    capture_service=capture_service,
+                                    frame_result=latest_frame_result,
+                                    fps=smoothed_fps,
+                                )
                             )
-                            smoothed_fps = (
-                                instantaneous
-                                if smoothed_fps <= 0
-                                else smoothed_fps * 0.8 + instantaneous * 0.2
-                            )
-                        latest_frame_time = now
+                            next_status_at = now + 1.0
                     except Exception as error:
                         self._write_error(
-                            f"Tracking frame failed: {error}"
+                            f"Live preview frame failed: {error}"
                         )
                     finally:
                         capture_service.task_done()
 
-                if show_preview and latest_frame is not None:
-                    preview = latest_frame.copy()
-                    self.draw_tracking_preview(
-                        frame=preview,
-                        pipeline=pipeline,
-                        frame_result=latest_frame_result,
-                        fps=smoothed_fps,
+                if show_preview and latest_preview is not None:
+                    cv2.imshow(
+                        "Campus Security ANPR Tracking",
+                        latest_preview,
                     )
-                    cv2.imshow("Campus Security ANPR Tracking", preview)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
 
                 capture_stats = capture_service.stats()
-                if capture_stats.ended and capture_stats.queue.size == 0:
+                if (
+                    capture_stats.ended
+                    and capture_stats.queue.size == 0
+                    and tracking_future is None
+                ):
                     break
 
                 if packet is None:
@@ -351,9 +440,27 @@ class Command(BaseCommand):
 
         except KeyboardInterrupt:
             self._write_warning("CCTV ANPR stopped by user.")
+        except Exception as error:
+            shutdown_state = "ERROR"
+            shutdown_error = f"{type(error).__name__}: {error}"
+            raise
         finally:
             if capture_service is not None:
                 capture_service.stop(timeout=5, clear_queue=True)
+
+            if tracking_future is not None:
+                try:
+                    latest_frame_result = tracking_future.result(timeout=60.0)
+                except Exception as error:
+                    self._write_error(
+                        f"Final tracking frame failed: {error}"
+                    )
+
+            if tracking_executor is not None:
+                tracking_executor.shutdown(
+                    wait=True,
+                    cancel_futures=False,
+                )
 
             pipeline_stopped = pipeline.stop(drain=True, timeout=60.0)
             cv2.destroyAllWindows()
@@ -387,9 +494,191 @@ class Command(BaseCommand):
                     "Some background workers did not stop before timeout."
                 )
 
+            self._live_publisher.submit_status(
+                self._build_live_status(
+                    state=shutdown_state,
+                    pipeline=pipeline,
+                    capture_service=capture_service,
+                    frame_result=latest_frame_result,
+                    fps=smoothed_fps,
+                    error=shutdown_error,
+                )
+            )
+            publisher_stopped = self._live_publisher.stop(
+                drain=True,
+                timeout=5.0,
+            )
+            publisher_stats = self._live_publisher.stats()
+            self.stdout.write(
+                "Live summary        : "
+                f"frames={publisher_stats.frames_published}, "
+                f"frame_dropped={publisher_stats.frames_dropped}, "
+                f"events={publisher_stats.detections_published}, "
+                f"publish_failed="
+                f"{publisher_stats.frames_failed + publisher_stats.statuses_failed + publisher_stats.detections_failed}"
+            )
+            if not publisher_stopped:
+                self._write_warning(
+                    "Live publisher did not stop before timeout."
+                )
+
             self.stdout.write(
                 self.style.SUCCESS("CCTV ANPR process closed.")
             )
+
+    def _submit_live_frame(self, *, frame, pipeline, frame_result, fps):
+        """Encode and enqueue one annotated frame without transport I/O."""
+
+        jpeg_quality = max(
+            40,
+            min(
+                95,
+                int(
+                    getattr(
+                        settings,
+                        "ANPR_LIVE_FRAME_JPEG_QUALITY",
+                        80,
+                    )
+                ),
+            ),
+        )
+        encoded_ok, encoded = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+        )
+        if not encoded_ok:
+            self._write_warning("Live frame JPEG encoding failed.")
+            return False
+
+        worker_stats = pipeline.worker_pool.stats()
+        detections = frame_result.detections if frame_result else ()
+        line_start, line_end = pipeline.line_detector.line_pixels(
+            frame.shape[1],
+            frame.shape[0],
+        )
+        metadata = {
+            "frame_index": (
+                frame_result.frame_index if frame_result else None
+            ),
+            "width": int(frame.shape[1]),
+            "height": int(frame.shape[0]),
+            "fps": round(float(fps), 2),
+            "vehicle_count": len(detections),
+            "tracked_count": sum(
+                detection.is_tracked for detection in detections
+            ),
+            "frame_processing_ms": round(
+                float(
+                    frame_result.frame_processing_ms
+                    if frame_result
+                    else 0.0
+                ),
+                2,
+            ),
+            "tracker_inference_ms": round(
+                float(
+                    frame_result.tracker_inference_ms
+                    if frame_result
+                    else 0.0
+                ),
+                2,
+            ),
+            "vehicle_queue_size": worker_stats.queue_size,
+            "vehicle_queue_capacity": worker_stats.queue_capacity,
+            "worker_in_flight": worker_stats.in_flight,
+            "line": {
+                "start": [int(line_start[0]), int(line_start[1])],
+                "end": [int(line_end[0]), int(line_end[1])],
+            },
+            "detections": [
+                {
+                    "track_id": detection.track_id,
+                    "vehicle_type": detection.vehicle_type,
+                    "confidence": round(
+                        float(detection.confidence),
+                        4,
+                    ),
+                    "bbox": [int(value) for value in detection.bbox],
+                    "tracked": detection.is_tracked,
+                }
+                for detection in detections
+            ],
+        }
+        return self._live_publisher.submit_frame(
+            encoded.tobytes(),
+            metadata,
+        )
+
+    def _build_live_status(
+        self,
+        *,
+        state,
+        pipeline,
+        capture_service,
+        frame_result,
+        fps,
+        error="",
+    ):
+        pipeline_stats = pipeline.stats()
+        worker_stats = pipeline.worker_pool.stats()
+        publisher_stats = self._live_publisher.stats()
+        capture_stats = (
+            capture_service.stats()
+            if capture_service is not None
+            else None
+        )
+        detections = frame_result.detections if frame_result else ()
+
+        return {
+            "state": str(state),
+            "gate_name": self._gate.name,
+            "gate_type": self._gate.gate_type,
+            "direction": self._direction,
+            "fps": round(float(fps), 2),
+            "target_fps": int(self._gate.target_fps),
+            "vehicle_count": len(detections),
+            "tracked_count": sum(
+                detection.is_tracked for detection in detections
+            ),
+            "frame_queue_size": (
+                capture_stats.queue.size if capture_stats else 0
+            ),
+            "frame_queue_capacity": (
+                capture_stats.queue.maxsize if capture_stats else 30
+            ),
+            "frame_queue_dropped": (
+                capture_stats.queue.dropped if capture_stats else 0
+            ),
+            "vehicle_queue_size": worker_stats.queue_size,
+            "vehicle_queue_capacity": worker_stats.queue_capacity,
+            "worker_in_flight": worker_stats.in_flight,
+            "worker_count": worker_stats.live_workers,
+            "worker_failures": worker_stats.failed,
+            "frames_processed": pipeline_stats.frames_processed,
+            "vehicles_observed": pipeline_stats.vehicles_observed,
+            "line_crossings": pipeline_stats.line_crossings,
+            "tasks_submitted": pipeline_stats.tasks_submitted,
+            "tasks_rejected": pipeline_stats.tasks_rejected,
+            "records_saved": pipeline_stats.records_saved,
+            "duplicates_ignored": pipeline_stats.duplicate_results,
+            "capture_running": (
+                capture_stats.running if capture_stats else False
+            ),
+            "camera_opened": (
+                capture_stats.opened if capture_stats else False
+            ),
+            "camera_reconnects": (
+                capture_stats.reconnects if capture_stats else 0
+            ),
+            "live_frames_dropped": publisher_stats.frames_dropped,
+            "live_publish_failures": (
+                publisher_stats.frames_failed
+                + publisher_stats.statuses_failed
+                + publisher_stats.detections_failed
+            ),
+            "error": str(error or ""),
+        }
 
     def _get_gate(self, gate_id):
         gate = Gate.objects.filter(id=gate_id).first()
@@ -398,6 +687,31 @@ class Command(BaseCommand):
         if not gate.is_active:
             raise CommandError(f"Gate ID {gate_id} is inactive.")
         return gate
+
+    @staticmethod
+    def _get_latest_capture_packet(capture_service, *, timeout=0.05):
+        """
+        Return the newest frame currently available from capture.
+
+        The first read may block briefly while waiting for a frame. Any
+        older packets already queued behind it are then discarded and
+        balanced with task_done(). The returned packet remains unfinished;
+        the normal processing loop marks that final packet done.
+
+        This keeps camera capture non-blocking and prevents slow tracking
+        inference from building seconds of visible preview latency.
+        """
+
+        newest = capture_service.get_frame(timeout=timeout)
+
+        while True:
+            try:
+                next_packet = capture_service.get_frame(timeout=0.0)
+            except queue.Empty:
+                return newest
+
+            capture_service.task_done()
+            newest = next_packet
 
     def _get_recording_user(self, user_id):
         user = User.objects.filter(id=user_id, is_active=True).first()
@@ -521,6 +835,7 @@ class Command(BaseCommand):
         self.stdout.write(f"Unknown OCR votes  : {required_votes}")
         self.stdout.write(f"Duplicate cooldown : {cooldown:g} seconds")
         self.stdout.write(f"Cache refresh      : {cache_refresh:g} seconds")
+        self.stdout.write("Live transport     : Redis + WebSocket")
         if show_preview:
             self.stdout.write("Press Q inside the video window to stop.")
 
@@ -555,6 +870,15 @@ class Command(BaseCommand):
             self._latest_activity_until = time.monotonic() + 3.0
 
         if result.saved:
+            record = None
+            if not self._diagnostic_only and result.record_id:
+                try:
+                    record = self._get_activity_record(result.record_id)
+                except Exception as error:
+                    self._write_error(
+                        f"Live activity record lookup failed: {error}"
+                    )
+
             action = (
                 "DIAGNOSTIC would save"
                 if self._diagnostic_only
@@ -566,9 +890,21 @@ class Command(BaseCommand):
                 f"Status: {result.authorization_status} | "
                 f"{result.processing_ms:.0f}ms"
             )
+
+            try:
+                self._publish_detection_activity(
+                    track=track,
+                    result=result,
+                    record=record,
+                )
+            except Exception as error:
+                self._write_error(
+                    f"Live detection publication failed: {error}"
+                )
+
             if not self._diagnostic_only and not result.authorized:
                 try:
-                    self.create_notification(result)
+                    self.create_notification(result, record=record)
                 except Exception as error:
                     self._write_error(
                         f"Notification creation failed: {error}"
@@ -584,13 +920,112 @@ class Command(BaseCommand):
             f"Track {track.track_id} processing failed: {error}"
         )
 
-    def create_notification(self, result):
+    def _get_activity_record(self, record_id):
+        return (
+            EntryExitRecord.objects.select_related(
+                "gate",
+                "vehicle",
+                "vehicle__department",
+            )
+            .filter(pk=record_id)
+            .first()
+        )
+
+    def _publish_detection_activity(self, *, track, result, record):
+        vehicle = record.vehicle if record is not None else None
+        department = vehicle.department if vehicle is not None else None
+
+        detected_company = (
+            getattr(record, "detected_vehicle_company", "")
+            if record is not None
+            else ""
+        )
+        detected_model = (
+            getattr(record, "detected_vehicle_model", "")
+            if record is not None
+            else ""
+        )
+        detected_color = (
+            getattr(record, "vehicle_color", "")
+            if record is not None
+            else ""
+        )
+        detected_type = (
+            getattr(record, "detected_vehicle_type", "")
+            if record is not None
+            else ""
+        )
+
+        payload = {
+            "record_id": record.pk if record is not None else None,
+            "track_id": int(track.track_id),
+            "plate": result.plate_text,
+            "authorization_status": result.authorization_status,
+            "authorized": bool(result.authorized),
+            "reason": result.reason,
+            "confidence": round(float(result.confidence), 4),
+            "votes": int(result.votes),
+            "candidates_attempted": int(result.candidates_attempted),
+            "processing_ms": round(float(result.processing_ms), 2),
+            "diagnostic_only": bool(self._diagnostic_only),
+            "owner": vehicle.owner_name if vehicle is not None else None,
+            "owner_type": (
+                vehicle.owner_type if vehicle is not None else None
+            ),
+            "department": str(department) if department is not None else None,
+            "company": (
+                vehicle.vehicle_company
+                if vehicle is not None
+                else detected_company or None
+            ),
+            "model": (
+                vehicle.vehicle_model
+                if vehicle is not None
+                else detected_model or None
+            ),
+            "color": (
+                vehicle.color
+                if vehicle is not None
+                else detected_color or None
+            ),
+            "vehicle_type": (
+                vehicle.vehicle_type
+                if vehicle is not None
+                else detected_type or None
+            ),
+            "gate": self._gate.name,
+            "direction": self._direction,
+            "timestamp": (
+                record.timestamp.isoformat()
+                if record is not None
+                else timezone.now().isoformat()
+            ),
+            "captured_image": self._field_url(
+                record.captured_image if record is not None else None
+            ),
+            "plate_image": self._field_url(
+                record.plate_image if record is not None else None
+            ),
+        }
+        return self._live_publisher.submit_detection(payload)
+
+    @staticmethod
+    def _field_url(field_file):
+        if not field_file:
+            return None
+        try:
+            return field_file.url
+        except (ValueError, AttributeError):
+            return None
+
+    def create_notification(self, result, record=None):
         if not result.record_id:
             return
 
-        record = EntryExitRecord.objects.select_related("gate").filter(
-            pk=result.record_id
-        ).first()
+        if record is None:
+            record = EntryExitRecord.objects.select_related("gate").filter(
+                pk=result.record_id
+            ).first()
         if record is None:
             return
 
